@@ -1,55 +1,93 @@
-from flask import Flask,render_template,request,redirect,url_for,flash
 import os,sqlite3
 from datetime import date
-BASE=os.path.dirname(os.path.abspath(__file__)); DB=os.path.join(BASE,"ledger.db")
-app=Flask(__name__); app.secret_key=os.environ.get("SECRET_KEY","change-this-secret")
+from flask import Flask,render_template,request,redirect,url_for,flash,Response,g
+app=Flask(__name__); app.secret_key=os.getenv("SECRET_KEY","local-secret")
+DB=os.path.join(os.path.dirname(__file__),"ledger.db")
 def db():
-    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
-def init_db():
-    c=db()
-    c.executescript("""CREATE TABLE IF NOT EXISTS customers(id INTEGER PRIMARY KEY AUTOINCREMENT,code TEXT UNIQUE NOT NULL,name TEXT NOT NULL,mobile TEXT,address TEXT,opening REAL DEFAULT 0,opening_type TEXT DEFAULT 'Debit',created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY AUTOINCREMENT,customer_id INTEGER NOT NULL,txn_date TEXT NOT NULL,voucher TEXT,particulars TEXT NOT NULL,debit REAL DEFAULT 0,credit REAL DEFAULT 0,payment_mode TEXT,notes TEXT,FOREIGN KEY(customer_id) REFERENCES customers(id));""")
-    c.commit(); c.close()
+    if "db" not in g:
+        g.db=sqlite3.connect(DB);g.db.row_factory=sqlite3.Row
+    return g.db
+@app.teardown_appcontext
+def close(e=None):
+    x=g.pop("db",None)
+    if x:x.close()
+def init():
+    x=sqlite3.connect(DB)
+    x.executescript("""CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,group_name TEXT NOT NULL,opening REAL DEFAULT 0,opening_type TEXT DEFAULT 'Dr',phone TEXT DEFAULT '',address TEXT DEFAULT '',gstin TEXT DEFAULT '',is_party INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS vouchers(id INTEGER PRIMARY KEY AUTOINCREMENT,vdate TEXT NOT NULL,vno TEXT NOT NULL,vtype TEXT NOT NULL,party_id INTEGER,amount REAL NOT NULL,narration TEXT DEFAULT '',mode TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS lines(id INTEGER PRIMARY KEY AUTOINCREMENT,voucher_id INTEGER,account_id INTEGER,debit REAL DEFAULT 0,credit REAL DEFAULT 0);""")
+    for n,gp,typ,party in [("Cash","Cash-in-Hand","Dr",0),("Bank","Bank Accounts","Dr",0),("Sales","Sales Accounts","Cr",0),("Purchase","Purchase Accounts","Dr",0),("Capital","Capital Account","Cr",0)]:
+        x.execute("INSERT OR IGNORE INTO accounts(name,group_name,opening,opening_type,is_party) VALUES(?,?,?,?,?)",(n,gp,0,typ,party))
+    x.commit();x.close()
+def n(v):
+    try:return float(v or 0)
+    except:return 0
+def save_voucher(t):
+    x=db(); amt=n(request.form.get("amount")); pid=int(request.form["party_id"]); mode=request.form.get("mode","Cash")
+    no=f"{t[:3].upper()}-{x.execute('SELECT COUNT(*) FROM vouchers WHERE vtype=?',(t,)).fetchone()[0]+1:04d}"
+    cur=x.execute("INSERT INTO vouchers(vdate,vno,vtype,party_id,amount,narration,mode) VALUES(?,?,?,?,?,?,?)",(request.form.get("vdate") or str(date.today()),no,t,pid,amt,request.form.get("narration",""),mode));vid=cur.lastrowid
+    contra=x.execute("SELECT id FROM accounts WHERE name=?",(mode,)).fetchone()["id"]
+    target={"Sales":"Sales","Purchase":"Purchase"}.get(t)
+    if t=="Receipt": rows=[(pid,0,amt),(contra,amt,0)]
+    elif t=="Payment": rows=[(pid,amt,0),(contra,0,amt)]
+    elif t=="Sales": rows=[(pid,amt,0),(x.execute("SELECT id FROM accounts WHERE name='Sales'").fetchone()["id"],0,amt)]
+    else: rows=[(x.execute("SELECT id FROM accounts WHERE name='Purchase'").fetchone()["id"],amt,0),(pid,0,amt)]
+    for aid,dr,cr in rows:x.execute("INSERT INTO lines(voucher_id,account_id,debit,credit) VALUES(?,?,?,?)",(vid,aid,dr,cr))
+    x.commit()
 @app.route("/")
-def dashboard():
-    c=db(); customers=c.execute("SELECT * FROM customers ORDER BY name").fetchall()
-    td=c.execute("SELECT COALESCE(SUM(debit),0)v FROM transactions").fetchone()["v"]
-    tc=c.execute("SELECT COALESCE(SUM(credit),0)v FROM transactions").fetchone()["v"]
-    op=c.execute("SELECT COALESCE(SUM(CASE WHEN opening_type='Debit' THEN opening ELSE -opening END),0)v FROM customers").fetchone()["v"]
-    c.close(); return render_template("dashboard.html",customers=customers,total_debit=td,total_credit=tc,opening=op,balance=op+td-tc)
-@app.route("/customers",methods=["GET","POST"])
-def customers():
-    c=db()
+def home():
+    x=db();return render_template("dashboard.html",parties=x.execute("SELECT COUNT(*) c FROM accounts WHERE is_party=1").fetchone()["c"],vouchers=x.execute("SELECT COUNT(*) c FROM vouchers").fetchone()["c"],sales=x.execute("SELECT COALESCE(SUM(amount),0) s FROM vouchers WHERE vtype='Sales'").fetchone()["s"],purchase=x.execute("SELECT COALESCE(SUM(amount),0) s FROM vouchers WHERE vtype='Purchase'").fetchone()["s"],recent=x.execute("SELECT v.*,a.name party FROM vouchers v LEFT JOIN accounts a ON a.id=v.party_id ORDER BY v.id DESC LIMIT 12").fetchall())
+@app.route("/parties",methods=["GET","POST"])
+def parties():
+    x=db()
     if request.method=="POST":
-        try:
-            c.execute("INSERT INTO customers(code,name,mobile,address,opening,opening_type) VALUES(?,?,?,?,?,?)",(request.form["code"].strip(),request.form["name"].strip(),request.form.get("mobile",""),request.form.get("address",""),float(request.form.get("opening") or 0),request.form.get("opening_type","Debit")))
-            c.commit(); flash("Customer added.","success")
-        except sqlite3.IntegrityError: flash("Customer ID already exists.","error")
-    rows=c.execute("SELECT * FROM customers ORDER BY name").fetchall(); c.close()
-    return render_template("customers.html",customers=rows)
-@app.route("/customer/<int:cid>")
-def ledger(cid):
-    c=db(); customer=c.execute("SELECT * FROM customers WHERE id=?",(cid,)).fetchone()
-    if not customer: c.close(); return "Customer not found",404
-    txns=c.execute("SELECT * FROM transactions WHERE customer_id=? ORDER BY txn_date,id",(cid,)).fetchall()
-    opening=customer["opening"] if customer["opening_type"]=="Debit" else -customer["opening"]; running=opening; ledger=[]
-    for x in txns: running+=x["debit"]-x["credit"]; ledger.append((x,running))
-    c.close(); return render_template("ledger.html",customer=customer,ledger=ledger,opening=opening,balance=running)
-@app.route("/entry/<int:cid>",methods=["GET","POST"])
-def entry(cid):
-    c=db(); customer=c.execute("SELECT * FROM customers WHERE id=?",(cid,)).fetchone()
-    if not customer: c.close(); return "Customer not found",404
+        try:x.execute("INSERT INTO accounts(name,group_name,opening,opening_type,phone,address,gstin,is_party) VALUES(?,?,?,?,?,?,?,1)",(request.form["name"],request.form.get("group_name","Sundry Debtors"),n(request.form.get("opening")),request.form.get("opening_type","Dr"),request.form.get("phone",""),request.form.get("address",""),request.form.get("gstin","")));x.commit();flash("Party added","success")
+        except:flash("Party already exists","error")
+        return redirect(url_for("parties"))
+    return render_template("parties.html",parties=x.execute("SELECT * FROM accounts WHERE is_party=1 ORDER BY name").fetchall())
+@app.route("/accounts",methods=["GET","POST"])
+def accounts():
+    x=db()
     if request.method=="POST":
-        debit=float(request.form.get("debit") or 0); credit=float(request.form.get("credit") or 0)
-        if (debit and credit) or (not debit and not credit): flash("Enter either Debit or Credit.","error")
-        else:
-            c.execute("INSERT INTO transactions(customer_id,txn_date,voucher,particulars,debit,credit,payment_mode,notes) VALUES(?,?,?,?,?,?,?,?)",(cid,request.form["txn_date"],request.form.get("voucher",""),request.form["particulars"],debit,credit,request.form.get("payment_mode",""),request.form.get("notes","")))
-            c.commit(); c.close(); return redirect(url_for("ledger",cid=cid))
-    c.close(); return render_template("entry.html",customer=customer,today=date.today().isoformat())
-@app.post("/delete_txn/<int:tid>/<int:cid>")
-def delete_txn(tid,cid):
-    c=db(); c.execute("DELETE FROM transactions WHERE id=?",(tid,)); c.commit(); c.close(); return redirect(url_for("ledger",cid=cid))
-@app.get("/health")
-def health(): return {"status":"ok"}
-init_db()
-if __name__=="__main__": app.run(host="0.0.0.0",port=int(os.environ.get("PORT","5000")),debug=False)
+        try:x.execute("INSERT INTO accounts(name,group_name,opening,opening_type) VALUES(?,?,?,?)",(request.form["name"],request.form.get("group_name","Other"),n(request.form.get("opening")),request.form.get("opening_type","Dr")));x.commit();flash("Account added","success")
+        except:flash("Account already exists","error")
+        return redirect(url_for("accounts"))
+    return render_template("accounts.html",accounts=x.execute("SELECT * FROM accounts ORDER BY group_name,name").fetchall())
+@app.route("/voucher/<t>",methods=["GET","POST"])
+def voucher(t):
+    if t not in ["Sales","Purchase","Receipt","Payment"]:return "Invalid",404
+    if request.method=="POST":
+        try:save_voucher(t);flash(t+" voucher saved","success");return redirect("/daybook")
+        except Exception as e:flash(str(e),"error")
+    return render_template("voucher.html",vtype=t,parties=db().execute("SELECT id,name FROM accounts WHERE is_party=1 ORDER BY name").fetchall(),today=str(date.today()))
+@app.route("/daybook")
+def daybook():
+    x=db();return render_template("daybook.html",rows=x.execute("SELECT v.*,a.name party FROM vouchers v LEFT JOIN accounts a ON a.id=v.party_id ORDER BY v.vdate DESC,v.id DESC").fetchall())
+@app.route("/ledger/<int:aid>")
+def ledger(aid):
+    x=db();a=x.execute("SELECT * FROM accounts WHERE id=?",(aid,)).fetchone()
+    rows=x.execute("SELECT v.vdate,v.vno,v.vtype,v.narration,l.debit,l.credit FROM lines l JOIN vouchers v ON v.id=l.voucher_id WHERE l.account_id=? ORDER BY v.vdate,v.id",(aid,)).fetchall()
+    bal=(a["opening"] if a["opening_type"]=="Dr" else -a["opening"]);out=[]
+    for r in rows:bal+=r["debit"]-r["credit"];out.append(dict(r,balance=bal))
+    return render_template("ledger.html",account=a,rows=out)
+@app.route("/reports")
+def reports():
+    x=db();out=[]
+    for a in x.execute("SELECT * FROM accounts ORDER BY name"):
+        t=x.execute("SELECT COALESCE(SUM(debit),0) dr,COALESCE(SUM(credit),0) cr FROM lines WHERE account_id=?",(a["id"],)).fetchone();b=(a["opening"] if a["opening_type"]=="Dr" else -a["opening"])+t["dr"]-t["cr"];out.append((a,b))
+    return render_template("reports.html",data=out)
+@app.route("/outstanding")
+def outstanding():
+    x=db();out=[]
+    for a in x.execute("SELECT * FROM accounts WHERE is_party=1 ORDER BY name"):
+        b=(a["opening"] if a["opening_type"]=="Dr" else -a["opening"])+x.execute("SELECT COALESCE(SUM(debit-credit),0) b FROM lines WHERE account_id=?",(a["id"],)).fetchone()["b"];out.append((a,b))
+    return render_template("outstanding.html",rows=out)
+@app.route("/export")
+def export():
+    x=db();rows=x.execute("SELECT vdate,vno,vtype,amount,mode,narration FROM vouchers ORDER BY vdate,id").fetchall()
+    s="Date,Voucher,Type,Amount,Mode,Narration\n"+"\n".join(",".join('"'+str(v or "").replace('"','""')+'"' for v in r) for r in rows)
+    return Response(s,mimetype="text/csv",headers={"Content-Disposition":"attachment; filename=ledger.csv"})
+@app.route("/health")
+def health():return {"status":"ok"}
+init()
+if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.getenv("PORT",5000)))
